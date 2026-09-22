@@ -1,6 +1,6 @@
 {
   "$schema": "node_modules/wrangler/config-schema.json",
-  "name": "skylark-msp-knowledge-api",
+  "name": "msp-knowledge-api",
   "main": "src/worker.js",
   "compatibility_date": "2026-09-22",
   "observability": { "enabled": true },
