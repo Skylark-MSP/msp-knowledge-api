@@ -1,7 +1,17 @@
 {
+  "$schema": "./node_modules/wrangler/config-schema.json",
   "name": "msp-knowledge-api",
   "main": "./src/worker.js",
   "compatibility_date": "2026-09-22",
   "workers_dev": true,
-  "preview_urls": false
+  "preview_urls": false,
+  "keep_vars": true,
+  "secrets": {
+    "required": [
+      "GITHUB_APP_CLIENT_ID",
+      "GITHUB_APP_CLIENT_SECRET",
+      "STATE_SECRET_HEX",
+      "SESSION_SECRET_HEX"
+    ]
+  }
 }
