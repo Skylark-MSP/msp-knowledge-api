@@ -1,9 +1,13 @@
 {
-  "$schema": "./node_modules/wrangler/config-schema.json",
+  "$schema": "node_modules/wrangler/config-schema.json",
   "name": "msp-knowledge-api",
   "main": "./src/worker.js",
   "compatibility_date": "2026-09-22",
   "workers_dev": true,
   "preview_urls": false,
-  "keep_vars": true
+  "keep_vars": true,
+  "observability": {
+    "enabled": true,
+    "head_sampling_rate": 1
+  }
 }
