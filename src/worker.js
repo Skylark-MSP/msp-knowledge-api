@@ -258,6 +258,11 @@ async function loadSession(request, env) {
         refreshToken: data.refresh_token || session.refreshToken,
         exp: Date.now() + expiresIn * 1000,
       };
+      console.log("SESSION_SECRET_HEX diagnostics", {
+      present: typeof env.SESSION_SECRET_HEX === "string" && env.SESSION_SECRET_HEX.length > 0,
+      length: env.SESSION_SECRET_HEX?.length ?? 0,
+      validHex64: /^[0-9a-fA-F]{64}$/.test(env.SESSION_SECRET_HEX || "")
+      });
       const encrypted = await encryptJson(session, env.SESSION_SECRET_HEX);
       return { session, setCookie: await sessionCookie(encrypted, expiresIn * 1000) };
     }
