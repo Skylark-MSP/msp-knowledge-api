@@ -8,6 +8,9 @@ const DEFAULT_REPOS = [
 ];
 
 const DOCUMENT_HISTORY_FILE = '_DOCUMENT-HISTORY.csv';
+const AUDIT_TABLE = 'audit_logs';
+const AUDIT_EVENTS = ['LOGIN', 'LOGOUT', 'KB_VIEW', 'DOCUMENT_VIEW'];
+const LEAD_TEAM_SLUG = 'msp-leads';
 
 const REPO_META = {
   'l1-knowledge-base': {
@@ -301,7 +304,7 @@ async function loadDocumentHistory(token, org, repo, branch) {
 
   // Expected format:
   // File Name,File Path,Creator
-  // The portal intentionally does not use a Created Date field.
+  // Created Date is intentionally not used by the portal.
   for (const row of rows) {
     const filePath = String(row['file path'] || '')
       .trim()
@@ -442,6 +445,166 @@ function logAuthConfigDiagnostics(env, context) {
   return missing;
 }
 
+async function auditLog(env, event) {
+  if (!env.DB) {
+    console.warn('Audit database binding DB is not configured; audit event was not stored.', {
+      eventType: event?.eventType || null,
+      repo: event?.repo || null,
+      path: event?.path || null,
+    });
+    return false;
+  }
+
+  try {
+    const eventType = String(event?.eventType || '').trim().toUpperCase();
+    if (!AUDIT_EVENTS.includes(eventType)) return false;
+
+    await env.DB.prepare(`
+      INSERT INTO ${AUDIT_TABLE}
+        (event_type, github_id, username, display_name, repo, path, document_name)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
+    `).bind(
+      eventType,
+      event?.githubId ?? null,
+      String(event?.username || '').trim() || 'unknown',
+      String(event?.displayName || '').trim() || String(event?.username || '').trim() || 'unknown',
+      event?.repo ? String(event.repo) : null,
+      event?.path ? String(event.path) : null,
+      event?.documentName ? String(event.documentName) : null,
+    ).run();
+
+    return true;
+  } catch (error) {
+    // Audit failure must not make document access or login fail.
+    console.error('Audit log write failed', {
+      name: error?.name || 'Error',
+      message: error?.message || String(error),
+      eventType: event?.eventType || null,
+      repo: event?.repo || null,
+      path: event?.path || null,
+    });
+    return false;
+  }
+}
+
+async function isMspLead(token, org, username) {
+  const login = String(username || '').trim();
+  if (!login) return false;
+
+  const response = await githubFetch(
+    `/orgs/${encodeURIComponent(org)}/teams/${encodeURIComponent(LEAD_TEAM_SLUG)}/memberships/${encodeURIComponent(login)}`,
+    token,
+  );
+
+  if (response.status === 401) {
+    throw new Error('GitHub authorization is no longer valid. Please sign in again.');
+  }
+  if (response.status === 404) return false;
+  if (!response.ok) {
+    console.error('MSP-Leads membership check failed', {
+      status: response.status,
+      username: login,
+    });
+    return false;
+  }
+
+  const membership = await readJson(response);
+  return membership?.state === 'active';
+}
+
+async function requireLeadSession(request, env) {
+  const result = await loadSession(request, env);
+  if (!result.session) return { result, lead: false, response: null };
+  const cfg = config(env);
+  const lead = await isMspLead(result.session.ghToken, cfg.org, result.session.user?.login);
+  return { result, lead, response: null };
+}
+
+async function apiAdminAudit(request, env, url) {
+  try {
+    const { result, lead } = await requireLeadSession(request, env);
+    if (!result.session) {
+      return withCors(json({ error: 'Not authenticated.' }, 401), request, env);
+    }
+    if (!lead) {
+      return withCors(json({ error: 'MSP-Leads access is required.' }, 403), request, env);
+    }
+    if (!env.DB) {
+      return withCors(json({ error: 'Audit database is not configured. Bind the D1 database as DB and try again.' }, 503), request, env);
+    }
+
+    const requestedLimit = Number(url.searchParams.get('limit') || 100);
+    const requestedOffset = Number(url.searchParams.get('offset') || 0);
+    const limit = Number.isFinite(requestedLimit) ? Math.min(Math.max(Math.trunc(requestedLimit), 1), 200) : 100;
+    const offset = Number.isFinite(requestedOffset) ? Math.min(Math.max(Math.trunc(requestedOffset), 0), 100000) : 0;
+
+    const eventType = String(url.searchParams.get('event') || '').trim().toUpperCase();
+    const repo = String(url.searchParams.get('repo') || '').trim();
+    const username = String(url.searchParams.get('user') || '').trim();
+
+    const where = [];
+    const params = [];
+    if (eventType && AUDIT_EVENTS.includes(eventType)) {
+      where.push('event_type = ?');
+      params.push(eventType);
+    }
+    if (repo) {
+      where.push('repo = ?');
+      params.push(repo);
+    }
+    if (username) {
+      where.push('username LIKE ?');
+      params.push(`%${username}%`);
+    }
+
+    const whereSql = where.length ? `WHERE ${where.join(' AND ')}` : '';
+    const countRow = await env.DB.prepare(
+      `SELECT COUNT(*) AS total FROM ${AUDIT_TABLE} ${whereSql}`
+    ).bind(...params).first();
+    const total = Number(countRow?.total || 0);
+
+    const rowsResult = await env.DB.prepare(`
+      SELECT
+        id,
+        created_at,
+        event_type,
+        github_id,
+        username,
+        display_name,
+        repo,
+        path,
+        document_name
+      FROM ${AUDIT_TABLE}
+      ${whereSql}
+      ORDER BY id DESC
+      LIMIT ? OFFSET ?
+    `).bind(...params, limit, offset).all();
+
+    const rows = rowsResult?.results || [];
+    return withCors(
+      json({
+        rows,
+        total,
+        limit,
+        offset,
+        hasMore: offset + rows.length < total,
+      }),
+      request,
+      env,
+      result.setCookie ? { 'Set-Cookie': result.setCookie } : {},
+    );
+  } catch (error) {
+    if (String(error?.message || '').includes('GitHub authorization is no longer valid')) {
+      return withCors(json({ error: error.message }, 401), request, env, { 'Set-Cookie': clearCookie() });
+    }
+    console.error('Admin audit request failed', {
+      name: error?.name || 'Error',
+      message: error?.message || String(error),
+    });
+    return withCors(json({ error: error.message || 'Could not load audit history.' }, 500), request, env);
+  }
+}
+
 async function login(request, env) {
   const missing = logAuthConfigDiagnostics(env, 'login');
   if (missing.length) {
@@ -529,6 +692,13 @@ async function callback(request, env) {
       return redirectError(env, `Your GitHub account is not an active member of ${config(env).org}.`);
     }
 
+    await auditLog(env, {
+      eventType: 'LOGIN',
+      githubId: me.id,
+      username: me.login,
+      displayName: me.name || me.login,
+    });
+
     // Do not place a long-lived GitHub refresh token in the browser session.
     // The portal session is encrypted and short-lived; the user can re-authenticate
     // with GitHub when it expires. This avoids cross-site HttpOnly cookie problems
@@ -593,7 +763,9 @@ async function apiMe(request, env) {
       return withCors(json({ authenticated: false, error: 'Could not validate the GitHub authorization.' }, 502), request, env);
     }
 
-    const response = json({ authenticated: true, user: result.session.user });
+    const cfg = config(env);
+    const lead = await isMspLead(result.session.ghToken, cfg.org, result.session.user?.login);
+    const response = json({ authenticated: true, user: result.session.user, isLead: lead });
     return withCors(response, request, env, result.setCookie ? { 'Set-Cookie': result.setCookie } : {});
   } catch (error) {
     return withCors(json({ authenticated: false, error: error.message || 'Not authenticated.' }, 401), request, env, { 'Set-Cookie': clearCookie() });
@@ -657,6 +829,15 @@ async function apiTree(request, env, url) {
     }));
 
     const metadataCount = files.filter((file) => file.creator).length;
+
+    await auditLog(env, {
+      eventType: 'KB_VIEW',
+      githubId: result.session.user?.id,
+      username: result.session.user?.login,
+      displayName: result.session.user?.name,
+      repo,
+    });
+
     const response = json({
       repository: repo,
       files,
@@ -693,6 +874,16 @@ async function apiFile(request, env, url) {
       { headers: { Accept: 'application/vnd.github.raw+json' } },
     );
     if (!contentResponse.ok) return withCors(json({ error: 'Document could not be retrieved.' }, contentResponse.status === 404 ? 404 : 502), request, env);
+
+    await auditLog(env, {
+      eventType: 'DOCUMENT_VIEW',
+      githubId: result.session.user?.id,
+      username: result.session.user?.login,
+      displayName: result.session.user?.name,
+      repo,
+      path,
+      documentName: path.split('/').pop(),
+    });
 
     const headers = new Headers();
     // Derive the MIME type from the requested path. GitHub raw-content responses
@@ -733,16 +924,34 @@ function health(request, env) {
       ok: missing.length === 0,
       missing,
       worker: 'msp-knowledge-api',
+      auditDbBound: Boolean(env.DB),
     }),
     request,
     env
   );
 }
 
-function logout(request, env) {
+async function logout(request, env) {
+  try {
+    const result = await loadSession(request, env);
+    if (result.session) {
+      await auditLog(env, {
+        eventType: 'LOGOUT',
+        githubId: result.session.user?.id,
+        username: result.session.user?.login,
+        displayName: result.session.user?.name,
+      });
+    }
+  } catch (error) {
+    // Logout must always succeed from the portal perspective.
+    console.warn('Logout audit/session cleanup warning', {
+      message: error?.message || String(error),
+    });
+  }
+
   return withCors(new Response(JSON.stringify({ ok: true }), {
     status: 200,
-    headers: { 'Content-Type': 'application/json; charset=utf-8', 'Set-Cookie': clearCookie() },
+    headers: { 'Content-Type': 'application/json; charset=utf-8', 'Set-Cookie': clearCookie(), 'Cache-Control': 'no-store' },
   }), request, env);
 }
 
@@ -760,6 +969,7 @@ export default {
       if (url.pathname === '/api/repositories' && request.method === 'GET') return apiRepositories(request, env);
       if (url.pathname === '/api/tree' && request.method === 'GET') return apiTree(request, env, url);
       if (url.pathname === '/api/file' && request.method === 'GET') return apiFile(request, env, url);
+      if (url.pathname === '/api/admin/audit' && request.method === 'GET') return apiAdminAudit(request, env, url);
 
       return json({ error: 'Not found.' }, 404, corsHeaders(request, env));
     } catch (error) {
